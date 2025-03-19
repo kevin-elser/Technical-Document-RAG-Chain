@@ -1,4 +1,3 @@
-from langchain.chains import RetrievalQA
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -53,11 +52,11 @@ class DocumentProcessor:
         chunk_size = int(os.getenv("CHUNK_SIZE", 2000))
         chunk_overlap = int(os.getenv("CHUNK_OVERLAP", 400))
         
-        # Better chunking strategy with smaller chunks to avoid breaking content
+        # Chunking strategy utilizing small chunks to avoid breaking content
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size, 
             chunk_overlap=chunk_overlap,
-            separators=["\n\n", "\n", ". ", " ", ""],  # More gradual splitting
+            separators=["\n\n", "\n", ". ", " ", ""],
             length_function=len
         )
         
@@ -89,10 +88,10 @@ class DocumentProcessor:
         if not self.raw_pages or len(self.raw_pages) < 3:
             return None
             
-        # Initialize OpenAI model for TOC extraction
+        # Initialize AI model for TOC extraction
         llm = ChatOpenAI(
-            model_name=os.getenv("MODEL_NAME", "gpt-3.5-turbo-1106"), 
-            temperature=0.0,  # Use 0 temperature for deterministic extraction
+            model_name=os.getenv("MODEL_NAME", "gpt-4o-mini"), 
+            temperature=0.0,
             openai_api_key=openrouter_api_key,
             openai_api_base="https://openrouter.ai/api/v1"
         )
