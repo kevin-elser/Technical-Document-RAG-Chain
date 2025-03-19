@@ -1,3 +1,4 @@
 .env
-documents/*
+documents
 test.py
+response.md
