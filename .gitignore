@@ -5,5 +5,5 @@ test.py
 sessions
 .venv
 
-
+!example_output.md
 !README.md

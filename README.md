@@ -2,6 +2,10 @@
 
 A simple Retrieval-Augmented Generation (RAG) system for querying PDF documents using LangChain and OpenRouter. Features both single query usage and chat persistence. Entirely possible to UI-ify this to display the chats and the entire conversation in a single UI instance.
 
+## Example
+
+You can see an example output in the provided `example_output.md` file of the sort of response that can be generated off a query. This response had the embedding model break down the entire 14 page PDF, and the large model was able to search through this data to answer the query (provided as well at the top of the example).
+
 ## Setup
 
 1. Install dependencies:
