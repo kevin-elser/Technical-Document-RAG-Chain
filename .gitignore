@@ -1,4 +1,9 @@
 .env
 documents
 test.py
-response.md
+*.md
+sessions
+.venv
+
+
+!README.md

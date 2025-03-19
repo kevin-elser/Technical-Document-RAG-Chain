@@ -6,11 +6,18 @@ from langchain_openai import ChatOpenAI
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.prompts import PromptTemplate
 from langchain_core.documents import Document
+from langchain_core.messages import HumanMessage, AIMessage
+from langgraph.graph import END, StateGraph
+from langgraph.checkpoint.sqlite import SqliteSaver
 import os
 import argparse
 import re
 import json
+from pathlib import Path
+from typing import Dict, List, Any, TypedDict, Optional
 from dotenv import load_dotenv
+import datetime
+import sqlite3
 
 # Load environment variables from .env file
 load_dotenv(dotenv_path=".env")
@@ -91,39 +98,56 @@ class DocumentProcessor:
         )
         
         first_pages = self.raw_pages[:10]
-        toc_content = "\n\n".join([f"Page {i}: {page.page_content}" for i, page in enumerate(first_pages)])
+        print(f"\nAnalyzing first {len(first_pages)} pages for TOC:")
+        for i, page in enumerate(first_pages):
+            print(f"\nPage {i} content preview: {page.page_content[:200]}...")
         
-        # Create a direct prompt for TOC extraction
-        toc_prompt = f"""Extract the complete table of contents from this document, including all 
-        chapters, sections, and subsections with their page numbers if available.
+        # Focus on pages that are likely to contain the TOC (usually pages 1-3)
+        toc_pages = self.raw_pages[1:4]  # Skip cover page, take next 3 pages
+        toc_content = "\n\n".join([f"Page {i+1}: {page.page_content}" for i, page in enumerate(toc_pages)])
         
-        Format your response as JSON with the following structure:
+        # Create a direct prompt for TOC extraction that focuses on numbered sections
+        toc_prompt = f"""You are parsing a technical document's table of contents. The document uses a clear numbered structure (e.g., "1. Basic gameplay", "1.1 Basic gameplay", etc.).
+
+Your task is to extract the complete table of contents, paying special attention to:
+1. The numbered chapter and section structure (e.g., "1.", "1.1", "1.1.1")
+2. The exact chapter/section titles as they appear
+3. The page numbers listed for each entry
+
+Format your response as JSON with this structure:
+{{
+    "toc": [
         {{
-            "toc": [
+            "level": 1,
+            "number": "1",
+            "title": "Basic gameplay",
+            "page": page_number,
+            "sections": [
                 {{
-                    "level": 1,  
-                    "title": "Chapter title",
+                    "level": 2,
+                    "number": "1.1",
+                    "title": "Basic gameplay",
                     "page": page_number,
-                    "sections": [
-                        {{
-                            "level": 2,
-                            "title": "Section title",
-                            "page": page_number
-                            "sections": [ ... ]
-                        }}
-                    ]
+                    "sections": []
                 }}
             ]
         }}
+    ]
+}}
+
+Important guidelines:
+1. Preserve the exact numbering scheme from the document (e.g., "1.", "1.1", "8.3.2")
+2. Include ALL sections and subsections
+3. Keep the exact section titles as they appear
+4. Include page numbers when available
+5. Maintain the hierarchical structure based on the numbering
+6. Only output valid JSON without any additional text
+
+Document content to parse:
+{toc_content}
+"""
         
-        If you can't find a complete TOC, extract as much structured information as possible about the document's organization.
-        Only output valid JSON without any additional text.
-        
-        Document content:
-        {toc_content}
-        """
-        
-        print("Extracting TOC from document...")
+        print("\nExtracting TOC from document...")
         try:
             response = llm.invoke(toc_prompt)
             
@@ -137,7 +161,8 @@ class DocumentProcessor:
             
             content = content.strip()
             toc_data = json.loads(content)
-            print("Successfully extracted TOC")
+            print("\nExtracted TOC structure:")
+            print(json.dumps(toc_data, indent=2))
             return toc_data
         except Exception as e:
             print(f"Error extracting TOC: {e}")
@@ -182,12 +207,69 @@ class DocumentProcessor:
         relevant_entries = extract_relevant_entries(self.toc_data["toc"])
         return "\n".join(relevant_entries)
 
+# Define the state schema for our LangGraph
+class RAGState(TypedDict):
+    """State for the RAG system"""
+    messages: List[Any]  # Chat history containing HumanMessage and AIMessage objects
+    documents: Optional[List[Document]]  # Processed documents
+    raw_pages: Optional[List[Document]]  # Original document pages
+    toc_data: Optional[Dict[str, Any]]  # Table of contents data
+    retriever: Optional[Any]  # FAISS retriever
+    current_query: Optional[str]  # Current query
+    current_response: Optional[str]  # Current response
+    source_documents: Optional[List[Document]]  # Source documents for response
+    output_file: Optional[str]  # Output file path
+
 def is_toc_query(query):
     """Check if this is a TOC-related query"""
     toc_terms = ["table of contents", "toc", "chapters", "outline", "sections", "what is in this document"]
     return any(term in query.lower() for term in toc_terms)
 
-def setup_rag_chain(documents, toc_data=None, model_name=None, temperature=None, max_tokens=None):
+def setup_rag_retriever(documents, model_name=None):
+    """Set up the RAG retriever with document embeddings"""
+    # Use HuggingFace embeddings 
+    embedding_model_name = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+    print(f"Using embedding model: {embedding_model_name}")
+    embeddings = HuggingFaceEmbeddings(model_name=embedding_model_name)
+    
+    # Create vector database with Document objects
+    db = FAISS.from_documents(documents, embeddings)
+    
+    # Return the retriever with proper configuration
+    return db.as_retriever(search_kwargs={"k": 15})
+
+def get_prompt_template():
+    """Get the prompt template for the RAG system"""
+    return PromptTemplate(
+        template="""You are an expert technical document analyst with the ability to understand complex technical information. 
+Your task is to provide accurate, thorough, and well-structured answers based on the provided context from a technical document.
+
+Guidelines:
+1. If the context doesn't contain the answer, clearly state this instead of guessing
+2. If answering about document structure (like table of contents), present a complete and organized view
+3. When analyzing technical content, be precise and maintain technical accuracy
+4. When asked about a specific chapter or section, focus your answer on that portion
+5. Present information in a well-structured format for readability
+6. Always provide COMPLETE AND COMPREHENSIVE information - do not truncate your response
+7. When listing chapters or sections, ensure you include ALL of them that appear in the context
+8. Format code blocks, tables, and technical details properly with markdown
+9. Use conversation history for context when answering follow-up questions
+
+Previous messages:
+{chat_history}
+
+Given the following sections from a technical document:
+
+{context}
+
+Question: {question}
+
+Comprehensive Answer (provide thorough detail and don't omit information):""", 
+        input_variables=["context", "question", "chat_history"]
+    )
+
+def create_llm(model_name=None, temperature=None, max_tokens=None):
+    """Create an LLM instance with the specified parameters"""
     # Get default parameters from environment variables if not provided
     if model_name is None:
         model_name = os.getenv("MODEL_NAME", "gpt-4o-mini")
@@ -198,195 +280,516 @@ def setup_rag_chain(documents, toc_data=None, model_name=None, temperature=None,
     if max_tokens is None:
         max_tokens = int(os.getenv("MAX_TOKENS", 4096))
     
-    # Use HuggingFace embeddings 
-    embedding_model_name = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-    print(f"Using embedding model: {embedding_model_name}")
-    embeddings = HuggingFaceEmbeddings(model_name=embedding_model_name)
-    
-    # Create vector database with Document objects
-    db = FAISS.from_documents(documents, embeddings)
-    
-    # Enhanced prompt with better instructions for document understanding
-    prompt_template = """You are an expert technical document analyst with the ability to understand complex technical information. 
-    Your task is to provide accurate, thorough, and well-structured answers based on the provided context from a technical document.
-
-    Guidelines:
-    1. If the context doesn't contain the answer, clearly state this instead of guessing
-    2. If answering about document structure (like table of contents), present a complete and organized view
-    3. When analyzing technical content, be precise and maintain technical accuracy
-    4. When asked about a specific chapter or section, focus your answer on that portion
-    5. Present information in a well-structured format for readability
-    6. Always provide COMPLETE AND COMPREHENSIVE information - do not truncate your response
-    7. When listing chapters or sections, ensure you include ALL of them that appear in the context
-    8. Format code blocks, tables, and technical details properly with markdown
-
-    Given the following sections from a technical document:
-
-    {context}
-
-    Question: {question}
-
-    Comprehensive Answer (provide thorough detail and don't omit information):"""
-    
-    # Create prompt without TOC info to avoid input validation issues
-    PROMPT = PromptTemplate(
-        template=prompt_template, 
-        input_variables=["context", "question"]
-    )
-    
     # Use ChatOpenAI with appropriate configuration
-    llm = ChatOpenAI(
+    return ChatOpenAI(
         model_name=model_name, 
         temperature=temperature,
         max_tokens=max_tokens,
         openai_api_key=openrouter_api_key,
         openai_api_base="https://openrouter.ai/api/v1"
     )
+
+def get_formatted_messages(messages, max_messages=10):
+    """Format messages for prompt context"""
+    if not messages:
+        return ""
+        
+    # Take the last few messages
+    recent_messages = messages[-max_messages:]
     
-    # Configure the chain to use the retriever and prompt
-    chain_type_kwargs = {"prompt": PROMPT}
-    qa = RetrievalQA.from_chain_type(
-        llm=llm, 
-        chain_type="stuff", 
-        retriever=db.as_retriever(search_kwargs={"k": 15}),  # Increased from 12 to get more context
-        return_source_documents=True, 
-        chain_type_kwargs=chain_type_kwargs
-    )
+    # Format the messages
+    formatted = ""
+    for message in recent_messages:
+        if isinstance(message, HumanMessage):
+            formatted += f"User: {message.content}\n"
+        elif isinstance(message, AIMessage):
+            formatted += f"Assistant: {message.content}\n\n"
+    
+    return formatted
 
-    return qa, llm, toc_data
-
-def run_query(qa_chain, llm, raw_pages, toc_data, query, output_file=None):
+def process_query(state: RAGState):
+    """Process a query using the RAG system"""
+    query = state["current_query"]
+    
+    if not query:
+        return {**state, "current_response": "No query provided"}
+    
     print(f"Processing query: {query}")
     
-    # Special handling for TOC queries - use extracted TOC if available
-    if is_toc_query(query) and toc_data:
-        print("Detected TOC query - using extracted TOC data")
+    # Ensure we have a retriever
+    if not state.get("retriever") and state.get("documents"):
+        print("Setting up retriever...")
+        retriever = setup_rag_retriever(state["documents"])
+        state = {**state, "retriever": retriever}
+    
+    # Check if query is about specific chapters
+    chapter_match = re.search(r'chapter (\d+)', query.lower())
+    if chapter_match and state.get("toc_data"):
+        chapter_num = chapter_match.group(1)
+        print(f"Looking for information about Chapter {chapter_num}")
         
-        # Create a comprehensive TOC description from the extracted data
-        toc_description = "# Table of Contents\n\n"
+        # Find the chapter in TOC
+        chapter_info = None
+        if isinstance(state["toc_data"], dict) and "toc" in state["toc_data"]:
+            for entry in state["toc_data"]["toc"]:
+                if entry.get("number") == chapter_num:
+                    chapter_info = entry
+                    break
         
-        def format_toc_for_display(entries, level=0):
-            toc_text = ""
-            for entry in entries:
-                indent = "  " * level
-                title = entry.get("title", "Unknown")
-                page = entry.get("page", "")
-                page_text = f" (page {page})" if page else ""
-                toc_text += f"{indent}- **{title}**{page_text}\n"
+        if chapter_info:
+            # Get the page number and content for this chapter
+            page_num = chapter_info.get("page")
+            if page_num and state.get("raw_pages"):
+                # Find the relevant page content
+                chapter_content = None
+                for doc in state["raw_pages"]:
+                    if doc.metadata.get("page") == page_num:
+                        chapter_content = doc.page_content
+                        break
                 
-                if "sections" in entry and isinstance(entry["sections"], list):
-                    toc_text += format_toc_for_display(entry["sections"], level + 1)
-            return toc_text
-        
-        if isinstance(toc_data, dict) and "toc" in toc_data:
-            toc_description += format_toc_for_display(toc_data["toc"])
-        else:
-            toc_description += "Could not extract a structured table of contents from this document."
-        
-        # Add additional information prompt for more comprehensive TOC response
-        toc_prompt = f"""
-        You are analyzing a technical document and need to present its table of contents in a clear,
-        structured format. Here is the extracted table of contents information:
-        
-        {toc_description}
-        
-        Please format this information as a complete, well-structured table of contents.
-        Add a brief introduction about what this document appears to cover based on the chapter titles.
-        Format your response using proper markdown with headings, bullet points, and indentation to show the hierarchy.
-        If specific page numbers are available, include them.
-        """
-        
-        response = llm.invoke(toc_prompt)
-        result = response.content
-        sources = raw_pages[:10]  # First 10 pages as sources
-    else:
-        # For regular queries, use the QA chain with only the required inputs
-        # The TOC data will be incorporated into the context through the document metadata
-        
-        # Create the standard input dict without toc_info
-        input_dict = {"query": query}
-        
-        # If we have TOC data, enhance the query with relevant information
-        enhanced_query = query
-        if toc_data and isinstance(toc_data, dict) and "toc" in toc_data:
-            # Extract page numbers from the query if present
-            page_refs = re.findall(r'pages? (\d+)(?:\s*-\s*(\d+))?', query, re.IGNORECASE)
-            
-            if page_refs:
-                # Add TOC context for those specific pages to the query
-                for start_page, end_page in page_refs:
-                    start = int(start_page)
-                    end = int(end_page) if end_page else start
+                if chapter_content:
+                    # Create a response about the chapter
+                    chapter_title = chapter_info.get("title", "")
+                    sections = chapter_info.get("sections", [])
                     
-                    relevant_toc = []
+                    context = f"Chapter {chapter_num}: {chapter_title}\n\n{chapter_content}\n\n"
+                    if sections:
+                        context += "\nSections in this chapter:\n"
+                        for section in sections:
+                            context += f"- {section.get('number')}: {section.get('title')} (page {section.get('page')})\n"
                     
-                    # Find TOC entries relevant to these pages
-                    def find_relevant_toc_entries(entries):
-                        results = []
-                        for entry in entries:
-                            page = entry.get("page")
-                            if page is not None:
-                                if isinstance(page, str) and page.isdigit():
-                                    page = int(page)
-                                if isinstance(page, int) and start <= page <= end:
-                                    results.append(f"{entry.get('title', 'Unknown')} (p.{page})")
-                            
-                            if "sections" in entry and isinstance(entry["sections"], list):
-                                results.extend(find_relevant_toc_entries(entry["sections"]))
-                        return results
+                    # Get response from LLM about the chapter
+                    llm = create_llm()
+                    prompt = get_prompt_template().format(
+                        context=context,
+                        question=f"What is Chapter {chapter_num} about? Please provide a detailed summary.",
+                        chat_history=get_formatted_messages(state.get("messages", []))
+                    )
                     
-                    if "toc" in toc_data:
-                        relevant_toc = find_relevant_toc_entries(toc_data["toc"])
+                    response = llm.invoke(prompt)
+                    result = response.content
                     
-                    # If we found relevant TOC entries, enhance the query
-                    if relevant_toc:
-                        relevant_context = "\n".join(relevant_toc)
-                        print(f"Adding relevant TOC context for pages {start}-{end}")
-            
-        
-        response = qa_chain.invoke(input_dict)
-        result = response["result"]
-        sources = response["source_documents"]
+                    # Update state with response
+                    new_messages = state.get("messages", []) + [
+                        HumanMessage(content=query),
+                        AIMessage(content=result)
+                    ]
+                    
+                    return {
+                        **state,
+                        "current_response": result,
+                        "source_documents": [doc for doc in state["raw_pages"] if doc.metadata.get("page") == page_num],
+                        "messages": new_messages
+                    }
     
-    # Write the result to output file if specified
-    if output_file:
-        with open(output_file, 'w', encoding='utf-8') as f:
+    # If not a chapter query or chapter not found, proceed with normal RAG
+    if not state.get("retriever"):
+        return {**state, "current_response": "Retriever not initialized"}
+    
+    # Get relevant documents
+    retriever = state["retriever"]
+    relevant_docs = retriever.invoke(query)
+    
+    # Format context from relevant documents
+    context = "\n\n".join([f"[Page {doc.metadata.get('page', 'unknown')}] {doc.page_content}" for doc in relevant_docs])
+    
+    # Format chat history
+    chat_history = get_formatted_messages(state.get("messages", []))
+    
+    # Get response from LLM
+    llm = create_llm()
+    prompt = get_prompt_template().format(
+        context=context,
+        question=query,
+        chat_history=chat_history
+    )
+    
+    response = llm.invoke(prompt)
+    result = response.content
+    
+    # Write result to file if specified
+    if state.get("output_file"):
+        with open(state["output_file"], 'w', encoding='utf-8') as f:
             f.write(result)
-            
-        print(f"Response written to {output_file}")
+        print(f"Response written to {state['output_file']}")
     
-    return result, sources
+    # Update state with response
+    new_messages = state.get("messages", []) + [
+        HumanMessage(content=query),
+        AIMessage(content=result)
+    ]
+    
+    return {
+        **state,
+        "current_response": result,
+        "source_documents": relevant_docs,
+        "messages": new_messages
+    }
+
+def create_rag_graph():
+    """Create a LangGraph for the RAG system"""
+    workflow = StateGraph(RAGState)
+    
+    # Add a node for processing queries
+    workflow.add_node("process_query", process_query)
+    
+    # Set the entry point
+    workflow.set_entry_point("process_query")
+    
+    # Add an edge from the node to the end state
+    workflow.add_edge("process_query", END)
+    
+    # Compile the graph
+    return workflow.compile()
+
+def load_or_create_document(pdf_path):
+    """Load or create a document processor"""
+    processor = DocumentProcessor()
+    documents, raw_pages, toc_data = processor.load_and_process_documents(pdf_path)
+    retriever = setup_rag_retriever(documents)
+    
+    return documents, raw_pages, toc_data, retriever
+
+def get_session_db_path(session_id):
+    """Get the path to the session database"""
+    sessions_dir = Path("sessions")
+    sessions_dir.mkdir(exist_ok=True)
+    return sessions_dir / f"{session_id}.db"
+
+def list_sessions():
+    """List all available sessions"""
+    sessions_dir = Path("sessions")
+    sessions_dir.mkdir(exist_ok=True)
+    
+    sessions = []
+    for db_file in sessions_dir.glob("*.db"):
+        sessions.append(db_file.stem)
+    
+    return sessions
+
+def prepare_state_for_serialization(state):
+    """Prepare state for serialization by removing non-serializable objects"""
+    # Create a shallow copy to avoid modifying the original
+    serializable_state = dict(state)
+    
+    # Replace the retriever with its configuration
+    if "retriever" in serializable_state:
+        # We don't need to serialize the full retriever - just remove it
+        # and we'll recreate it when loaded based on the documents
+        serializable_state.pop("retriever", None)
+    
+    # Keep only serializable parts of documents if present
+    if "documents" in serializable_state:
+        # Documents should already be serializable, but let's ensure that
+        # we aren't storing any complex objects within them
+        pass
+    
+    # Simplify messages to just their content and type
+    if "messages" in serializable_state and serializable_state["messages"]:
+        simplified_messages = []
+        for msg in serializable_state["messages"]:
+            if isinstance(msg, HumanMessage):
+                simplified_messages.append({"type": "human", "content": msg.content})
+            elif isinstance(msg, AIMessage):
+                simplified_messages.append({"type": "ai", "content": msg.content})
+        serializable_state["_simplified_messages"] = simplified_messages
+        serializable_state.pop("messages", None)
+    
+    return serializable_state
+
+def restore_state_from_serialized(serialized_state):
+    """Restore a complete state from a serialized state"""
+    # Create a copy to avoid modifying the original
+    restored_state = dict(serialized_state)
+    
+    # Restore messages if simplified versions exist
+    if "_simplified_messages" in restored_state:
+        messages = []
+        for msg in restored_state["_simplified_messages"]:
+            if msg["type"] == "human":
+                messages.append(HumanMessage(content=msg["content"]))
+            elif msg["type"] == "ai":
+                messages.append(AIMessage(content=msg["content"]))
+        restored_state["messages"] = messages
+        restored_state.pop("_simplified_messages", None)
+    
+    # Recreate the retriever if we have documents
+    if "documents" in restored_state and not restored_state.get("retriever"):
+        if restored_state["documents"]:
+            # This will recreate the retriever from documents
+            retriever = setup_rag_retriever(restored_state["documents"])
+            restored_state["retriever"] = retriever
+    
+    return restored_state
+
+def run_query(pdf_path, query, session_id=None, output_file=None, model=None, temperature=None, max_tokens=None):
+    """Run a query against a document, using an optional session for context"""
+    # Create the graph
+    graph = create_rag_graph()
+    
+    # Create the state saver if using a session
+    if session_id:
+        # Get the database path
+        db_path = get_session_db_path(session_id)
+        db_path_str = str(db_path)
+        
+        try:
+            # Create a connection and initialize the database
+            conn = sqlite3.connect(db_path_str)
+            saver = SqliteSaver(conn)
+            
+            # Initialize the database schema
+            saver.setup()
+            
+            # Set up config for session
+            config = {"configurable": {"thread_id": session_id, "checkpoint_ns": session_id}}
+            print(f"Config being used for get_tuple: {config}") # DEBUG PRINT
+            try:
+                print(f"Attempting to load session: {session_id}")
+                # For debugging purposes, let's check what tables exist
+                cursor = conn.cursor()
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+                tables = cursor.fetchall()
+                print(f"Tables in database: {tables}")
+                
+                # Retrieve the previous state using get_tuple
+                try:
+                    checkpoint_tuple = saver.get_tuple(config)
+                    print(f"Checkpoint tuple retrieved: {checkpoint_tuple is not None}")
+                    print(f"Checkpoint data: {checkpoint_tuple.checkpoint if checkpoint_tuple else None}")
+                    
+                    # Check if we have a valid checkpoint with the correct structure
+                    if (checkpoint_tuple and 
+                        hasattr(checkpoint_tuple, 'checkpoint') and 
+                        isinstance(checkpoint_tuple.checkpoint, dict)):
+                        
+                        # Get the serialized state from channel_values
+                        serialized_state = checkpoint_tuple.checkpoint.get("channel_values", {}).get("default", {})
+                        if serialized_state:
+                            previous_state = restore_state_from_serialized(serialized_state)
+                            print(f"Loaded session state: {session_id}")
+                            
+                            # If we have a new PDF path, reload the document
+                            if pdf_path and (not previous_state or 
+                                            previous_state.get("_metadata", {}).get("pdf_path") != pdf_path):
+                                print(f"Loading new document from: {pdf_path}")
+                                documents, raw_pages, toc_data, retriever = load_or_create_document(pdf_path)
+                                
+                                # Initialize state with new document
+                                state = {
+                                    "messages": previous_state.get("messages", []) if previous_state else [],
+                                    "documents": documents,
+                                    "raw_pages": raw_pages,
+                                    "toc_data": toc_data,
+                                    "retriever": retriever,
+                                    "current_query": query,
+                                    "output_file": output_file,
+                                    "_metadata": {"pdf_path": pdf_path}
+                                }
+                            else:
+                                # Use existing session with new query
+                                state = {
+                                    **previous_state,
+                                    "current_query": query,
+                                    "output_file": output_file
+                                }
+                        else:
+                            print("No valid serialized state found in checkpoint. Creating new state...")
+                            documents, raw_pages, toc_data, retriever = load_or_create_document(pdf_path)
+                            state = {
+                                "messages": [],
+                                "documents": documents,
+                                "raw_pages": raw_pages,
+                                "toc_data": toc_data,
+                                "retriever": retriever,
+                                "current_query": query,
+                                "output_file": output_file,
+                                "_metadata": {"pdf_path": pdf_path}
+                            }
+                    else:
+                        print("Invalid checkpoint structure. Creating new state...")
+                        documents, raw_pages, toc_data, retriever = load_or_create_document(pdf_path)
+                        state = {
+                            "messages": [],
+                            "documents": documents,
+                            "raw_pages": raw_pages,
+                            "toc_data": toc_data,
+                            "retriever": retriever,
+                            "current_query": query,
+                            "output_file": output_file,
+                            "_metadata": {"pdf_path": pdf_path}
+                        }
+                except Exception as e:
+                    print(f"Error retrieving checkpoint tuple: {str(e)}")
+                    documents, raw_pages, toc_data, retriever = load_or_create_document(pdf_path)
+                    state = {
+                        "messages": [],
+                        "documents": documents,
+                        "raw_pages": raw_pages,
+                        "toc_data": toc_data,
+                        "retriever": retriever,
+                        "current_query": query,
+                        "output_file": output_file,
+                        "_metadata": {"pdf_path": pdf_path}
+                    }
+                
+                # Run the graph with the appropriate config
+                final_state = graph.invoke(state, config=config)
+                
+                # Save the state
+                try:
+                    print(f"Attempting to save session state: {session_id}")
+                    print(f"Config being used for put: {config}") # DEBUG PRINT
+                    metadata = {
+                        "source": "rag_query", 
+                        "timestamp": str(datetime.datetime.now()),
+                        "query": query
+                    }
+                    
+                    # Prepare the state for serialization
+                    serialized_state = prepare_state_for_serialization(final_state)
+                    
+                    checkpoint = {
+                        "v": 1,  # version
+                        "id": session_id,  # session ID
+                        "ts": str(datetime.datetime.now()),  # timestamp
+                        "channel_values": {
+                            "default": serialized_state
+                        },
+                        "channel_versions": {
+                            "default": 1
+                        },
+                        "versions_seen": {},
+                        "pending_sends": []
+                    }
+                    
+                    saver.put(
+                        config=config,
+                        checkpoint=checkpoint,
+                        metadata=metadata,
+                        new_versions={"default": 1}
+                    )
+                    print(f"Session state saved: {session_id}")
+                    
+                except Exception as e:
+                    print(f"Error saving session state: {str(e)}")
+                    print(f"Type of error: {type(e)}")
+                    print(f"Full error details: {e.__dict__ if hasattr(e, '__dict__') else 'No additional details'}")
+                
+                # Close the connection
+                conn.close()
+                return final_state.get("current_response", ""), final_state.get("source_documents", [])
+                
+            except Exception as e:
+                print(f"Error reading session: {str(e)}")
+                conn.close()
+                # Create new state if session read fails
+                documents, raw_pages, toc_data, retriever = load_or_create_document(pdf_path)
+                state = {
+                    "messages": [],
+                    "documents": documents,
+                    "raw_pages": raw_pages,
+                    "toc_data": toc_data,
+                    "retriever": retriever,
+                    "current_query": query,
+                    "output_file": output_file,
+                    "_metadata": {"pdf_path": pdf_path}
+                }
+                config = {}
+                
+                # Run the graph without session
+                final_state = graph.invoke(state, config=config)
+                return final_state.get("current_response", ""), final_state.get("source_documents", [])
+                
+        except Exception as e:
+            print(f"Error setting up session: {str(e)}")
+            print("Continuing without session persistence...")
+            
+            # Fall back to non-session approach
+            documents, raw_pages, toc_data, retriever = load_or_create_document(pdf_path)
+            state = {
+                "messages": [],
+                "documents": documents,
+                "raw_pages": raw_pages,
+                "toc_data": toc_data,
+                "retriever": retriever,
+                "current_query": query,
+                "output_file": output_file
+            }
+            config = {}
+            
+            # Run the graph without session
+            final_state = graph.invoke(state, config=config)
+            return final_state.get("current_response", ""), final_state.get("source_documents", [])
+    else:
+        # No session, just load the document and create a one-time state
+        documents, raw_pages, toc_data, retriever = load_or_create_document(pdf_path)
+        state = {
+            "messages": [],
+            "documents": documents,
+            "raw_pages": raw_pages,
+            "toc_data": toc_data,
+            "retriever": retriever,
+            "current_query": query,
+            "output_file": output_file
+        }
+        config = {}
+        
+        # Run the graph without session
+        final_state = graph.invoke(state, config=config)
+        return final_state.get("current_response", ""), final_state.get("source_documents", [])
 
 def main():
     parser = argparse.ArgumentParser(description="Technical Document RAG System")
-    parser.add_argument("pdf_path", help="Path to the PDF document")
-    parser.add_argument("query", help="The question to ask")
+    parser.add_argument("pdf_path", nargs="?", help="Path to the PDF document")
+    parser.add_argument("query", nargs="?", help="The question to ask")
     parser.add_argument("--model", help="The LLM model to use (overrides .env setting)")
     parser.add_argument("--temp", type=float, help="The temperature for the LLM (overrides .env setting)")
     parser.add_argument("--max-tokens", type=int, help="Maximum tokens in response (overrides .env setting)")
     parser.add_argument("--output", help="Output file for the response (in markdown format)")
+    parser.add_argument("--session", help="Session ID to maintain conversation context")
+    parser.add_argument("--list-sessions", action="store_true", help="List all available sessions")
     args = parser.parse_args()
-
-    processor = DocumentProcessor()
-    documents, raw_pages, toc_data = processor.load_and_process_documents(args.pdf_path)
     
-    print(f"Setting up RAG chain with model: {args.model or os.getenv('MODEL_NAME', 'gpt-3.5-turbo-1106')}")
-    qa_chain, llm, toc_data = setup_rag_chain(
-        documents, 
-        toc_data=toc_data,
-        model_name=args.model, 
+    # List sessions if requested
+    if args.list_sessions:
+        sessions = list_sessions()
+        if sessions:
+            print("Available sessions:")
+            for session in sessions:
+                print(f"  - {session}")
+        else:
+            print("No sessions found.")
+        return
+    
+    # Validate parameters
+    if not args.session and (not args.pdf_path or not args.query):
+        parser.print_help()
+        return
+    
+    if args.session and not args.query:
+        print("Error: No query provided for session.")
+        return
+    
+    if args.session and not args.pdf_path:
+        # Check if session exists before proceeding
+        db_path = get_session_db_path(args.session)
+        # Use os.path.exists instead of Path.exists() for better compatibility
+        if not os.path.exists(str(db_path)):
+            print(f"Error: Session '{args.session}' does not exist and no PDF path provided.")
+            return
+    
+    # Process the query
+    print(f"Processing query with {'' if not args.session else f'session {args.session}: '}{args.query}")
+    
+    answer, source_docs = run_query(
+        args.pdf_path, 
+        args.query, 
+        session_id=args.session,
+        output_file=args.output,
+        model=args.model,
         temperature=args.temp,
         max_tokens=args.max_tokens
-    )
-    
-    print(f"Querying: {args.query}")
-    answer, source_docs = run_query(
-        qa_chain, 
-        llm, 
-        raw_pages, 
-        toc_data,
-        args.query,
-        output_file=args.output
     )
 
     print("\nAnswer:", answer)
