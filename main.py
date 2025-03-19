@@ -310,11 +310,28 @@ def get_formatted_messages(messages, max_messages=10):
 def process_query(state: RAGState):
     """Process a query using the RAG system"""
     query = state["current_query"]
+    messages = state.get("messages", [])
     
     if not query:
         return {**state, "current_response": "No query provided"}
     
     print(f"Processing query: {query}")
+    
+    # Handle "please continue" or similar continuation queries
+    if query.lower().strip() in ["please continue", "continue", "what's next", "what is next", "go on"]:
+        # Look at previous messages to find what chapter we were discussing
+        prev_chapter = None
+        for msg in reversed(messages):
+            if isinstance(msg, HumanMessage):
+                chapter_match = re.search(r'chapter (\d+)', msg.content.lower())
+                if chapter_match:
+                    prev_chapter = int(chapter_match.group(1))
+                    # Look for the next chapter
+                    query = f"What is chapter {prev_chapter + 1} about?"
+                    break
+        
+        if not prev_chapter:
+            return {**state, "current_response": "I'm not sure what you'd like me to continue with. Could you please specify?"}
     
     # Ensure we have a retriever
     if not state.get("retriever") and state.get("documents"):
@@ -339,20 +356,29 @@ def process_query(state: RAGState):
         if chapter_info:
             # Get the page number and content for this chapter
             page_num = chapter_info.get("page")
-            if page_num and state.get("raw_pages"):
-                # Find the relevant page content
-                chapter_content = None
-                for doc in state["raw_pages"]:
-                    if doc.metadata.get("page") == page_num:
-                        chapter_content = doc.page_content
+            next_chapter_page = None
+            
+            # Find the next chapter's starting page to know where this chapter ends
+            if isinstance(state["toc_data"], dict) and "toc" in state["toc_data"]:
+                for entry in state["toc_data"]["toc"]:
+                    if entry.get("number") == str(int(chapter_num) + 1):
+                        next_chapter_page = entry.get("page")
                         break
+            
+            if page_num and state.get("raw_pages"):
+                # Collect all content from this chapter's pages
+                chapter_content = []
+                for doc in state["raw_pages"]:
+                    doc_page = doc.metadata.get("page")
+                    if doc_page >= page_num and (next_chapter_page is None or doc_page < next_chapter_page):
+                        chapter_content.append(doc.page_content)
                 
                 if chapter_content:
                     # Create a response about the chapter
                     chapter_title = chapter_info.get("title", "")
                     sections = chapter_info.get("sections", [])
                     
-                    context = f"Chapter {chapter_num}: {chapter_title}\n\n{chapter_content}\n\n"
+                    context = f"Chapter {chapter_num}: {chapter_title}\n\n{''.join(chapter_content)}\n\n"
                     if sections:
                         context += "\nSections in this chapter:\n"
                         for section in sections:
@@ -375,10 +401,17 @@ def process_query(state: RAGState):
                         AIMessage(content=result)
                     ]
                     
+                    # Collect all the pages that were part of this chapter
+                    chapter_docs = [
+                        doc for doc in state["raw_pages"] 
+                        if doc.metadata.get("page") >= page_num 
+                        and (next_chapter_page is None or doc.metadata.get("page") < next_chapter_page)
+                    ]
+                    
                     return {
                         **state,
                         "current_response": result,
-                        "source_documents": [doc for doc in state["raw_pages"] if doc.metadata.get("page") == page_num],
+                        "source_documents": chapter_docs,
                         "messages": new_messages
                     }
     
